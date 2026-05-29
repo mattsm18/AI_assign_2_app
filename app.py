@@ -287,6 +287,11 @@ with col_map:
     for _, z in zones_gdf.iterrows():
         geom = z.geometry
 
+        # IMPORTANT: skip invalid / empty geometries
+        if geom is None or geom.is_empty:
+            continue
+
+        # handle Polygon only (ignore MultiPolygon for now safely)
         if geom.geom_type == "Polygon":
             coords = [(y, x) for x, y in geom.exterior.coords]
 
@@ -297,7 +302,7 @@ with col_map:
                 fill_opacity=0.15,
                 tooltip=z.get("name", z["zone"])
             ).add_to(m)
-
+            
     map_data = st_folium(
         m,
         width="100%",
