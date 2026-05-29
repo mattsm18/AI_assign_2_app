@@ -313,73 +313,66 @@ DATA = load_everything()
 
 
 # ═══════════════════════════════════════════════════════════════
-# SPATIAL QUERY  (fast — uses STRtree)
+# SPATIAL QUERY  (fast — uses STRtree + session_state cache)
 # ═══════════════════════════════════════════════════════════════
 
-@st.cache_data(max_entries=2000)
 def classify_point(lat: float, lon: float) -> str:
     """
-    Returns 'sea' | 'reserve' | 'residential'
-    
-    STRtree.query() returns candidate indices whose bounding boxes intersect
-    the point; we then do exact contains() only on those candidates — O(log n).
+    Returns 'sea' | 'reserve' | 'residential'.
+    Results cached in session_state — zero cost on repeated clicks.
+    STRtree narrows candidates to O(log n) before exact contains().
     """
-    pt = Point(lon, lat)
+    key = (round(lat, 4), round(lon, 4))
+    cache = st.session_state.setdefault("_zone_cache", {})
+    if key in cache:
+        return cache[key]
 
-    # Check parks first (most clicks are on land)
+    pt = Point(key[1], key[0])  # Point(lon, lat)
+
     for idx in DATA["park_tree"].query(pt):
         if DATA["parks_gdf"].geometry.iloc[idx].contains(pt):
+            cache[key] = "reserve"
             return "reserve"
 
-    # Check coastline (land polygons)
-    on_land = False
-    for idx in DATA["coast_tree"].query(pt):
-        if DATA["coast_gdf"].geometry.iloc[idx].contains(pt):
-            on_land = True
-            break
+    on_land = any(
+        DATA["coast_gdf"].geometry.iloc[idx].contains(pt)
+        for idx in DATA["coast_tree"].query(pt)
+    )
 
-    # If the click is not inside any land polygon → ocean
-    if not on_land:
-        return "sea"
-
-    return "residential"
+    result = "residential" if on_land else "sea"
+    cache[key] = result
+    return result
 
 
 def predict(lat: float, lon: float) -> dict:
     """Full prediction for a clicked point."""
-    zone = classify_point(round(lat, 4), round(lon, 4))
+    key = (round(lat, 4), round(lon, 4))
+    pcache = st.session_state.setdefault("_pred_cache", {})
+    if key in pcache:
+        return pcache[key]
 
-    df  = DATA["suburbs_df"]
-    dists = np.sqrt((df["lat"] - lat)**2 + (df["lon"] - lon)**2)
-    closest_idx    = dists.idxmin()
-    closest_suburb = df.loc[closest_idx, "suburb"]
-    closest_km     = dists[closest_idx] * 111.0
+    zone = classify_point(lat, lon)
+
+    df    = DATA["suburbs_df"]
+    dists = np.sqrt((df["lat"] - lat) ** 2 + (df["lon"] - lon) ** 2)
+    ci    = dists.idxmin()
 
     cbd_km = np.linalg.norm(np.array([lat, lon]) - CBD) * 111.0
 
     result = dict(
-        zone=zone,
-        lat=lat,
-        lon=lon,
+        zone=zone, lat=lat, lon=lon,
         cbd_km=cbd_km,
-        closest_suburb=closest_suburb,
-        closest_km=closest_km,
-        price=None,
-        price_low=None,
-        price_high=None,
+        closest_suburb=df.loc[ci, "suburb"],
+        closest_km=dists[ci] * 111.0,
+        price=None, price_low=None, price_high=None,
     )
 
     if zone == "residential":
-        coords_s = DATA["scaler"].transform([[lat, lon]])
-        raw      = float(DATA["rbf"](coords_s)[0])
-        price    = float(np.clip(raw, *PRICE_BOUNDS))
-        # ±12 % confidence band
-        result.update(
-            price=price,
-            price_low=price * 0.88,
-            price_high=price * 1.12,
-        )
+        raw   = float(DATA["rbf"](DATA["scaler"].transform([[lat, lon]]))[0])
+        price = float(np.clip(raw, *PRICE_BOUNDS))
+        result.update(price=price, price_low=price * 0.88, price_high=price * 1.12)
 
+    pcache[key] = result
     return result
 
 
@@ -439,11 +432,15 @@ def build_base_map():
 # ═══════════════════════════════════════════════════════════════
 
 st.title("Auckland Land Price Estimator")
-st.markdown("<p style='color:#888;font-size:0.82rem;margin-top:-0.5rem;font-family:IBM Plex Mono,monospace'>Click anywhere on the map for an instant estimate</p>", unsafe_allow_html=True)
+st.markdown(
+    "<p style='color:#888;font-size:0.82rem;margin-top:-0.5rem;"
+    "font-family:IBM Plex Mono,monospace'>Click anywhere on the map for an instant estimate</p>",
+    unsafe_allow_html=True,
+)
 
 col_map, col_panel = st.columns([3, 1])
 
-# ── Map ──────────────────────────────────────────────────────
+# ── Map — rendered once, never re-runs on click ───────────────
 with col_map:
     map_data = st_folium(
         build_base_map(),
@@ -453,45 +450,74 @@ with col_map:
         key="main_map",
     )
 
-# ── Panel ────────────────────────────────────────────────────
-with col_panel:
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
-
+# ── Panel — @st.fragment means ONLY this block re-runs on click
+# The map above is completely skipped on subsequent reruns.
+@st.fragment
+def render_panel():
     clicked = map_data and map_data.get("last_clicked")
 
-    if not clicked:
-        st.markdown("<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>", unsafe_allow_html=True)
-    else:
-        lat = clicked["lat"]
-        lon = clicked["lng"]
-        res = predict(lat, lon)
+    with col_panel:
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
 
-        # Zone badge
-        zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
-        zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
-        z = res["zone"]
-        st.markdown(
-            f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
-            unsafe_allow_html=True,
-        )
-
-        if z == "residential" and res["price"] is not None:
+        if not clicked:
             st.markdown(
-                f"<div class='price-big'>${res['price']:,.0f}</div>"
-                f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
+                "<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>",
                 unsafe_allow_html=True,
             )
-        elif z == "reserve":
-            st.markdown("<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>", unsafe_allow_html=True)
         else:
-            st.markdown("<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>Ocean / Water<br><small style='color:#666'>No pricing available</small></div>", unsafe_allow_html=True)
+            lat = clicked["lat"]
+            lon = clicked["lng"]
+            res = predict(lat, lon)
 
-        st.markdown(f"<div class='stat-label'>Distance to CBD</div><div class='stat-value'>{res['cbd_km']:.1f} km</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='stat-label'>Nearest suburb</div><div class='stat-value'>{res['closest_suburb']}<br><span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='stat-label'>Coordinates</div><div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>", unsafe_allow_html=True)
+            zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
+            zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
+            z = res["zone"]
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
+                unsafe_allow_html=True,
+            )
+
+            if z == "residential" and res["price"] is not None:
+                st.markdown(
+                    f"<div class='price-big'>${res['price']:,.0f}</div>"
+                    f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
+                    unsafe_allow_html=True,
+                )
+            elif z == "reserve":
+                st.markdown(
+                    "<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>"
+                    "Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>"
+                    "Ocean / Water<br><small style='color:#666'>No pricing available</small></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                f"<div class='stat-label'>Distance to CBD</div>"
+                f"<div class='stat-value'>{res['cbd_km']:.1f} km</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='stat-label'>Nearest suburb</div>"
+                f"<div class='stat-value'>{res['closest_suburb']}<br>"
+                f"<span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='stat-label'>Coordinates</div>"
+                f"<div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+render_panel()
 
 # ── Data explorer ────────────────────────────────────────────
 with st.expander("Suburb reference data"):
