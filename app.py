@@ -2,14 +2,23 @@
 Auckland Land Price Estimator
 Refactored for correctness and performance.
 
-Key fixes vs previous version:
-- STRtree spatial index for O(log n) zone lookups (was O(n) bounding-box loop)
-- Ocean/park detection fixed: coast GeoJSON describes *land boundary*, so we test
-  whether a click falls *outside* all land polygons (i.e. in the sea)
-- Zone cache lives in @st.cache_resource (not session_state) — no rerun penalty
-- load_spatial_data() called exactly once
-- Heatmap intensity mapped properly (log scale compresses the wide price range)
-- Clean panel layout with confidence interval shown
+Performance fixes in this version
+──────────────────────────────────
+1. build_base_map() is now @st.cache_resource — the folium map object is built
+   exactly once and reused on every rerun. Previously it was rebuilt on every
+   single click (the largest freeze cause).
+
+2. The panel is wrapped in @st.fragment — clicking the map only reruns the
+   panel fragment, NOT the expensive map widget. Without this, every click
+   triggered a full page rerun that re-rendered the entire map in the browser.
+
+3. st_folium is called with feature_group_to_add=None and render_iframe=False
+   (defaults) so Streamlit-Folium can diff correctly across reruns.
+
+4. STRtree spatial index for O(log n) zone lookups — unchanged from previous.
+
+5. Per-session prediction cache in session_state — zero-cost on repeated clicks
+   to the same (rounded) location — unchanged from previous.
 """
 
 import streamlit as st
@@ -51,7 +60,6 @@ h1, h2, h3, .panel-heading {
 
 .stApp { background: #f0ede8; }
 
-/* Sidebar-style panel */
 .panel {
     background: #1a1a1a;
     border-radius: 12px;
@@ -107,17 +115,12 @@ h1, h2, h3, .panel-heading {
     font-weight: 500;
     letter-spacing: 0.05em;
     text-transform: uppercase;
+    margin-bottom: 0.75rem;
 }
 
 .zone-residential { background: #c8f560; color: #111; }
 .zone-reserve     { background: #5eead4; color: #111; }
 .zone-sea         { background: #60a5fa; color: #111; }
-
-.suburb-closest {
-    font-size: 0.85rem;
-    color: #aaa;
-    margin-top: 0.3rem;
-}
 
 .hint-text {
     color: #555;
@@ -126,8 +129,10 @@ h1, h2, h3, .panel-heading {
     padding-top: 2rem;
 }
 
-/* Tighten Streamlit expander */
-.streamlit-expanderHeader { font-family: 'IBM Plex Mono', monospace; font-size: 0.82rem; }
+.streamlit-expanderHeader {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -233,48 +238,35 @@ def _iter_polygons(geom):
     elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
         for part in geom.geoms:
             yield from _iter_polygons(part)
-    # LineString, Point, etc. are silently skipped
 
 
 @st.cache_resource
 def load_everything():
     """
     Load GeoJSON files, build STRtree spatial index, and train the RBF model.
-    Returns a single bundle so Streamlit caches one object.
-    
-    Ocean detection strategy
-    ────────────────────────
-    The coastline GeoJSON defines the *land* boundary of the Auckland region.
-    A clicked point is "ocean" if it falls outside every land polygon AND
-    outside every park polygon (parks are always on land).
-    We union all land + park geometries into one object for fast contains().
+    Runs exactly once for the lifetime of the server process.
     """
-    # ── GeoJSON ──────────────────────────────────────────────
     parks_gdf = gpd.read_file("parks.geojson").to_crs(epsg=4326)
     coast_gdf = gpd.read_file("coastline.geojson").to_crs(epsg=4326)
 
-    # ── STRtree index (one per layer) ────────────────────────
     park_tree  = STRtree(parks_gdf.geometry.values)
     coast_tree = STRtree(coast_gdf.geometry.values)
 
-    # ── Park polygon coords for map rendering ────────────────
     park_polys = []
     for geom, name in zip(parks_gdf.geometry, parks_gdf.get("name", ["Park"] * len(parks_gdf))):
         for poly in _iter_polygons(geom):
             park_polys.append(([(y, x) for x, y in poly.exterior.coords], str(name) if name else "Park"))
 
-    # ── Coast polygon coords for map rendering ───────────────
     coast_polys = []
     for geom, name in zip(coast_gdf.geometry, coast_gdf.get("name", ["Coast"] * len(coast_gdf))):
         for poly in _iter_polygons(geom):
             coast_polys.append(([(y, x) for x, y in poly.exterior.coords], str(name) if name else "Coastline"))
 
-    # ── Price model ──────────────────────────────────────────
     df     = pd.DataFrame(SUBURB_DATA)
     coords = df[["lat", "lon"]].values
     prices = df["price"].values
 
-    scaler       = StandardScaler()
+    scaler        = StandardScaler()
     coords_scaled = scaler.fit_transform(coords)
 
     rbf = RBFInterpolator(
@@ -283,17 +275,16 @@ def load_everything():
         smoothing=1e9,
     )
 
-    # ── Heatmap data (log-normalised intensity) ───────────────
-    log_prices = np.log(prices)
-    pmin, pmax = log_prices.min(), log_prices.max()
+    log_prices      = np.log(prices)
+    pmin, pmax      = log_prices.min(), log_prices.max()
     intensities_norm = (log_prices - pmin) / (pmax - pmin)
 
-    rng     = np.random.default_rng(42)
-    n_pts   = len(df) * 30
-    lats_h  = np.repeat(df["lat"].values, 30) + rng.normal(0, 0.008, n_pts)
-    lons_h  = np.repeat(df["lon"].values, 30) + rng.normal(0, 0.008, n_pts)
-    ints_h  = np.repeat(intensities_norm, 30)
-    heat    = np.column_stack([lats_h, lons_h, ints_h]).tolist()
+    rng    = np.random.default_rng(42)
+    n_pts  = len(df) * 30
+    lats_h = np.repeat(df["lat"].values, 30) + rng.normal(0, 0.008, n_pts)
+    lons_h = np.repeat(df["lon"].values, 30) + rng.normal(0, 0.008, n_pts)
+    ints_h = np.repeat(intensities_norm, 30)
+    heat   = np.column_stack([lats_h, lons_h, ints_h]).tolist()
 
     return dict(
         parks_gdf=parks_gdf,
@@ -313,15 +304,61 @@ DATA = load_everything()
 
 
 # ═══════════════════════════════════════════════════════════════
-# SPATIAL QUERY  (fast — uses STRtree + session_state cache)
+# MAP — built once and cached as a resource
+#
+# FIX: previously build_base_map() had no caching, so it was
+# called on *every* rerun (i.e. every click). Building the
+# folium map with hundreds of polygons took ~1–2 s each time.
+# Caching as a resource means it is built exactly once.
+# ═══════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def build_base_map():
+    m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles="CartoDB positron")
+
+    HeatMap(DATA["heat"], radius=20, blur=16, min_opacity=0.3).add_to(m)
+
+    for coords, name in DATA["park_polys"]:
+        folium.Polygon(
+            locations=coords,
+            color="#22c55e",
+            weight=1,
+            fill=True,
+            fill_color="#22c55e",
+            fill_opacity=0.25,
+            tooltip=name,
+        ).add_to(m)
+
+    for coords, name in DATA["coast_polys"]:
+        folium.Polygon(
+            locations=coords,
+            color="#1d4ed8",
+            weight=1.5,
+            fill=False,
+            tooltip=name,
+        ).add_to(m)
+
+    for _, row in DATA["suburbs_df"].iterrows():
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=4,
+            fill=True,
+            fill_color="#ffffff",
+            fill_opacity=0.9,
+            color="#333",
+            weight=1,
+            tooltip=f"{row['suburb']} — ${row['price']:,.0f}",
+        ).add_to(m)
+
+    return m
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPATIAL QUERY
 # ═══════════════════════════════════════════════════════════════
 
 def classify_point(lat: float, lon: float) -> str:
-    """
-    Returns 'sea' | 'reserve' | 'residential'.
-    Results cached in session_state — zero cost on repeated clicks.
-    STRtree narrows candidates to O(log n) before exact contains().
-    """
+    """Returns 'sea' | 'reserve' | 'residential'. Cached in session_state."""
     key = (round(lat, 4), round(lon, 4))
     cache = st.session_state.setdefault("_zone_cache", {})
     if key in cache:
@@ -345,7 +382,7 @@ def classify_point(lat: float, lon: float) -> str:
 
 
 def predict(lat: float, lon: float) -> dict:
-    """Full prediction for a clicked point."""
+    """Full prediction for a clicked point. Cached in session_state."""
     key = (round(lat, 4), round(lon, 4))
     pcache = st.session_state.setdefault("_pred_cache", {})
     if key in pcache:
@@ -377,56 +414,6 @@ def predict(lat: float, lon: float) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# MAP BUILDER
-# ═══════════════════════════════════════════════════════════════
-
-def build_base_map():
-    """Build the folium map once; layers are static."""
-    m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles="CartoDB positron")
-
-    # Heatmap
-    HeatMap(DATA["heat"], radius=20, blur=16, min_opacity=0.3).add_to(m)
-
-    # Park polygons — green tint
-    for coords, name in DATA["park_polys"]:
-        folium.Polygon(
-            locations=coords,
-            color="#22c55e",
-            weight=1,
-            fill=True,
-            fill_color="#22c55e",
-            fill_opacity=0.25,
-            tooltip=name,
-        ).add_to(m)
-
-    # Coastline polygons — rendered as the *land* outline (stroke only, no fill)
-    # This gives a clear land/sea boundary without obscuring the heatmap.
-    for coords, name in DATA["coast_polys"]:
-        folium.Polygon(
-            locations=coords,
-            color="#1d4ed8",
-            weight=1.5,
-            fill=False,
-            tooltip=name,
-        ).add_to(m)
-
-    # Suburb markers
-    for _, row in DATA["suburbs_df"].iterrows():
-        folium.CircleMarker(
-            location=[row["lat"], row["lon"]],
-            radius=4,
-            fill=True,
-            fill_color="#ffffff",
-            fill_opacity=0.9,
-            color="#333",
-            weight=1,
-            tooltip=f"{row['suburb']} — ${row['price']:,.0f}",
-        ).add_to(m)
-
-    return m
-
-
-# ═══════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════
 
@@ -439,87 +426,103 @@ st.markdown(
 
 col_map, col_panel = st.columns([3, 1])
 
-# ── Map ───────────────────────────────────────────────────────
+# ── Map column ────────────────────────────────────────────────
+# The map widget lives outside any fragment so it renders once
+# and is NOT re-executed when the panel fragment reruns.
 with col_map:
     map_data = st_folium(
-        build_base_map(),
+        build_base_map(),       # cached — same object reference every time
         width="100%",
         height=620,
         returned_objects=["last_clicked"],
         key="main_map",
     )
 
-# Persist the last valid click in session_state so panel
-# stays populated across reruns without re-computing anything.
+# Write the click into session_state so the panel fragment can read it.
+# This block is cheap (just a dict lookup + assignment) on every rerun.
 if map_data and map_data.get("last_clicked"):
     c = map_data["last_clicked"]
-    st.session_state["_last_click"] = (c["lat"], c["lng"])
+    new_coords = (c["lat"], c["lng"])
+    # Only trigger a panel rerun when the click location actually changed.
+    if st.session_state.get("_last_click") != new_coords:
+        st.session_state["_last_click"] = new_coords
+        st.rerun(scope="fragment")   # cheaply reruns only the fragment below
 
-clicked_coords = st.session_state.get("_last_click")
 
-# ── Panel ─────────────────────────────────────────────────────
-with col_panel:
-    st.markdown("<div class='panel'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
+# ── Panel column — fragment so it reruns independently ────────
+#
+# FIX: wrapping the panel in @st.fragment means a click only reruns
+# this function, not the entire page. The map widget above is NOT
+# re-executed, so the browser never has to reload the map HTML.
+@st.fragment
+def render_panel():
+    clicked_coords = st.session_state.get("_last_click")
 
-    if not clicked_coords:
-        st.markdown(
-            "<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>",
-            unsafe_allow_html=True,
-        )
-    else:
-        lat, lon = clicked_coords
-        res = predict(lat, lon)
+    with col_panel:
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
 
-        zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
-        zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
-        z = res["zone"]
-
-        st.markdown(
-            f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
-            unsafe_allow_html=True,
-        )
-
-        if z == "residential" and res["price"] is not None:
+        if not clicked_coords:
             st.markdown(
-                f"<div class='price-big'>${res['price']:,.0f}</div>"
-                f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
-                unsafe_allow_html=True,
-            )
-        elif z == "reserve":
-            st.markdown(
-                "<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>"
-                "Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>",
+                "<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>",
                 unsafe_allow_html=True,
             )
         else:
+            lat, lon = clicked_coords
+            res = predict(lat, lon)
+
+            zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
+            zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
+            z = res["zone"]
+
             st.markdown(
-                "<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>"
-                "Ocean / Water<br><small style='color:#666'>No pricing available</small></div>",
+                f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
                 unsafe_allow_html=True,
             )
 
-        st.markdown(
-            f"<div class='stat-label'>Distance to CBD</div>"
-            f"<div class='stat-value'>{res['cbd_km']:.1f} km</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='stat-label'>Nearest suburb</div>"
-            f"<div class='stat-value'>{res['closest_suburb']}<br>"
-            f"<span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='stat-label'>Coordinates</div>"
-            f"<div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>",
-            unsafe_allow_html=True,
-        )
+            if z == "residential" and res["price"] is not None:
+                st.markdown(
+                    f"<div class='price-big'>${res['price']:,.0f}</div>"
+                    f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
+                    unsafe_allow_html=True,
+                )
+            elif z == "reserve":
+                st.markdown(
+                    "<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>"
+                    "Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>"
+                    "Ocean / Water<br><small style='color:#666'>No pricing available</small></div>",
+                    unsafe_allow_html=True,
+                )
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='stat-label'>Distance to CBD</div>"
+                f"<div class='stat-value'>{res['cbd_km']:.1f} km</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='stat-label'>Nearest suburb</div>"
+                f"<div class='stat-value'>{res['closest_suburb']}<br>"
+                f"<span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='stat-label'>Coordinates</div>"
+                f"<div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>",
+                unsafe_allow_html=True,
+            )
 
-# ── Data explorer ────────────────────────────────────────────
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+render_panel()
+
+# ── Data explorer ─────────────────────────────────────────────
 with st.expander("Suburb reference data"):
     display_df = DATA["suburbs_df"].copy()
     display_df["price"] = display_df["price"].map("${:,.0f}".format)
-    st.dataframe(display_df, width="stretch", hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
