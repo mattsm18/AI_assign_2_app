@@ -150,7 +150,7 @@ def load_zone_geodata():
     else:
         zones = gpd.GeoDataFrame(columns=["geometry", "zone", "zone_name"])
 
-    return gpd.GeoDataFrame(zones, crs="EPSG:4326")
+    return zones.to_crs("EPSG:4326") if hasattr(zones, "crs") and zones.crs else gpd.GeoDataFrame(zones, geometry="geometry")
 
 # ── Model ───────────────────────────────────────────────────────────────────────
 @st.cache_resource
