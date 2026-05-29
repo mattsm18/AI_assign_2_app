@@ -380,7 +380,6 @@ def predict(lat: float, lon: float) -> dict:
 # MAP BUILDER
 # ═══════════════════════════════════════════════════════════════
 
-@st.cache_resource
 def build_base_map():
     """Build the folium map once; layers are static."""
     m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles="CartoDB positron")
@@ -523,4 +522,4 @@ with col_panel:
 with st.expander("Suburb reference data"):
     display_df = DATA["suburbs_df"].copy()
     display_df["price"] = display_df["price"].map("${:,.0f}".format)
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width="stretch", hide_index=True)
