@@ -6,6 +6,10 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 from scipy.interpolate import RBFInterpolator
 from sklearn.preprocessing import StandardScaler
+import osmnx as ox
+from shapely.geometry import Point
+import warnings
+warnings.filterwarnings("ignore")
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -100,13 +104,53 @@ SUBURB_DATA = [
     {"suburb": "Takapuna",          "lat": -36.7883, "lon": 174.7700, "price": 1800000, "dist_km": 8.0},
 ]
 
-NON_RESIDENTIAL_ZONES = [
-    {"name": "Waitakere Ranges", "lat_min": -37.05, "lat_max": -36.80, "lon_min": 174.45, "lon_max": 174.58, "zone": "reserve"},
-    {"name": "Hauraki Gulf",     "lat_min": -36.90, "lat_max": -36.60, "lon_min": 174.90, "lon_max": 175.20, "zone": "sea"},
-    {"name": "Manukau Harbour",  "lat_min": -37.10, "lat_max": -36.90, "lon_min": 174.60, "lon_max": 174.75, "zone": "sea"},
-    {"name": "Waitemata Harbour","lat_min": -36.84, "lat_max": -36.78, "lon_min": 174.68, "lon_max": 174.82, "zone": "sea"},
-    {"name": "Cornwall Park",    "lat_min": -36.905,"lat_max": -36.890,"lon_min": 174.775,"lon_max": 174.790,"zone": "reserve"},
-]
+# ── OSM zone data — fetched once, cached for session ───────────────────────────
+@st.cache_resource(show_spinner="Loading Auckland zone boundaries from OpenStreetMap…")
+def load_zone_geodata():
+    """
+    Fetch real water and reserve polygons from OpenStreetMap for Auckland.
+    Cached so it only runs once per Streamlit session.
+    """
+    bbox = (-37.35, -36.40, 174.40, 175.30)  # south, north, west, east
+
+    # Water bodies: sea, harbour, lake, river
+    try:
+        water = ox.features_from_bbox(
+            bbox=bbox,
+            tags={"natural": ["water", "bay"], "waterway": ["riverbank"], "landuse": "reservoir"}
+        )
+        water = water[water.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+        water["zone"] = "sea"
+        water["zone_name"] = water.get("name", pd.Series(["Water"] * len(water))).fillna("Water")
+    except Exception:
+        water = gpd.GeoDataFrame()
+
+    # Parks and reserves
+    try:
+        reserves = ox.features_from_bbox(
+            bbox=bbox,
+            tags={"leisure": ["park", "nature_reserve", "golf_course"],
+                  "landuse": ["forest", "grass", "meadow", "recreation_ground"],
+                  "boundary": "national_park"}
+        )
+        reserves = reserves[reserves.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+        reserves["zone"] = "reserve"
+        reserves["zone_name"] = reserves.get("name", pd.Series(["Reserve"] * len(reserves))).fillna("Reserve")
+    except Exception:
+        reserves = gpd.GeoDataFrame()
+
+    import geopandas as gpd
+    if len(water) > 0 and len(reserves) > 0:
+        zones = pd.concat([water[["geometry", "zone", "zone_name"]],
+                           reserves[["geometry", "zone", "zone_name"]]], ignore_index=True)
+    elif len(water) > 0:
+        zones = water[["geometry", "zone", "zone_name"]]
+    elif len(reserves) > 0:
+        zones = reserves[["geometry", "zone", "zone_name"]]
+    else:
+        zones = gpd.GeoDataFrame(columns=["geometry", "zone", "zone_name"])
+
+    return gpd.GeoDataFrame(zones, crs="EPSG:4326")
 
 # ── Model ───────────────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -120,34 +164,41 @@ def build_model():
     return rbf, scaler, df
 
 @st.cache_data
-def generate_heatmap_points(_rbf, _scaler):
-    """Sample the RBF model on a grid to generate heatmap data."""
-    lat_grid = np.linspace(-37.25, -36.40, 60)
-    lon_grid = np.linspace(174.50, 175.10, 60)
-    lats, lons = np.meshgrid(lat_grid, lon_grid)
-    points = np.column_stack([lats.ravel(), lons.ravel()])
-    scaled = _scaler.transform(points)
-    preds = _rbf(scaled)
-    # clamp
-    preds = np.clip(preds, 400000, 5000000)
-    # normalise 0–1 for heatmap intensity
-    p_min, p_max = preds.min(), preds.max()
-    intensity = (preds - p_min) / (p_max - p_min)
-    heat_data = [
-        [points[i, 0], points[i, 1], float(intensity[i])]
-        for i in range(len(points))
-        if intensity[i] > 0.05  # skip very low-value points (reduces noise at edges)
-    ]
+def generate_heatmap_points(suburb_data):
+    """
+    Build heatmap directly from suburb data points.
+    Each suburb contributes jittered points weighted by price,
+    so Folium's gaussian blur does the spreading naturally — no RBF grid
+    extrapolation flooding the whole bounding box.
+    """
+    df = pd.DataFrame(suburb_data)
+    p_min = df["price"].min()
+    p_max = df["price"].max()
+    rng = np.random.default_rng(42)
+    heat_data = []
+    for _, row in df.iterrows():
+        intensity = 0.2 + 0.8 * (row["price"] - p_min) / (p_max - p_min)
+        n_pts = 30
+        jitter_deg = 0.012  # ~1.3 km spread per suburb
+        jit_lat = rng.normal(0, jitter_deg, n_pts)
+        jit_lon = rng.normal(0, jitter_deg, n_pts)
+        for jl, jo in zip(jit_lat, jit_lon):
+            heat_data.append([row["lat"] + jl, row["lon"] + jo, float(intensity)])
     return heat_data
 
-def classify_zone(lat, lon):
-    for z in NON_RESIDENTIAL_ZONES:
-        if z["lat_min"] <= lat <= z["lat_max"] and z["lon_min"] <= lon <= z["lon_max"]:
-            return z["zone"], z["name"]
+def classify_zone(lat, lon, zones_gdf):
+    """Point-in-polygon test against real OSM boundaries."""
+    pt = Point(lon, lat)
+    for _, row in zones_gdf.iterrows():
+        try:
+            if row.geometry and row.geometry.contains(pt):
+                return row["zone"], str(row["zone_name"])
+        except Exception:
+            continue
     return "residential", "Residential"
 
-def predict_price(lat, lon, rbf, scaler):
-    zone, zone_name = classify_zone(lat, lon)
+def predict_price(lat, lon, rbf, scaler, zones_gdf):
+    zone, zone_name = classify_zone(lat, lon, zones_gdf)
     if zone != "residential":
         return None, zone, zone_name
     coords = scaler.transform([[lat, lon]])
@@ -157,7 +208,8 @@ def predict_price(lat, lon, rbf, scaler):
 
 # ── Build model & heatmap data ──────────────────────────────────────────────────
 rbf, scaler, df = build_model()
-heat_data = generate_heatmap_points(rbf, scaler)
+zones_gdf = load_zone_geodata()
+heat_data = generate_heatmap_points(SUBURB_DATA)
 
 # ── Header ──────────────────────────────────────────────────────────────────────
 col_title, _ = st.columns([3, 1])
@@ -180,16 +232,16 @@ with col_map:
     # ── Heatmap layer ──────────────────────────────────────────────────────────
     HeatMap(
         heat_data,
-        min_opacity=0.35,
+        min_opacity=0.3,
         max_opacity=0.75,
-        radius=28,
-        blur=22,
+        radius=18,
+        blur=14,
         gradient={
-            0.0: "#313695",   # deep blue  — low price
-            0.3: "#74add1",   # light blue
-            0.5: "#fee090",   # yellow     — mid
-            0.7: "#f46d43",   # orange
-            1.0: "#a50026",   # deep red   — high price
+            0.0: "#313695",
+            0.3: "#74add1",
+            0.5: "#fee090",
+            0.7: "#f46d43",
+            1.0: "#a50026",
         },
     ).add_to(m)
 
@@ -233,7 +285,7 @@ with col_panel:
         lat = map_data["last_clicked"]["lat"]
         lon = map_data["last_clicked"]["lng"]
 
-        price, zone, zone_name = predict_price(lat, lon, rbf, scaler)
+        price, zone, zone_name = predict_price(lat, lon, rbf, scaler, zones_gdf)
 
         zone_class = {
             "residential": "zone-residential",
