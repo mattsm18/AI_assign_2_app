@@ -284,23 +284,21 @@ with col_map:
         ).add_to(m)
 
     # draw GIS zones
-    for _, z in zones_gdf.iterrows():
+    for z in zones_gdf.itertuples():
         geom = z.geometry
 
-        # IMPORTANT: skip invalid / empty geometries
         if geom is None or geom.is_empty:
             continue
 
-        # handle Polygon only (ignore MultiPolygon for now safely)
         if geom.geom_type == "Polygon":
             coords = [(y, x) for x, y in geom.exterior.coords]
 
             folium.Polygon(
                 locations=coords,
-                color="#4cc9f0" if z["zone"] == "sea" else "#57cc99",
+                color="#4cc9f0",
                 fill=True,
                 fill_opacity=0.15,
-                tooltip=z.get("name", z["zone"])
+                tooltip=getattr(z, "name", "zone"),
             ).add_to(m)
             
     map_data = st_folium(
