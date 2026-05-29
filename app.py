@@ -7,6 +7,7 @@ from streamlit_folium import st_folium
 from scipy.interpolate import RBFInterpolator
 from sklearn.preprocessing import StandardScaler
 import osmnx as ox
+import geopandas as gpd
 from shapely.geometry import Point
 import warnings
 warnings.filterwarnings("ignore")
@@ -139,7 +140,6 @@ def load_zone_geodata():
     except Exception:
         reserves = gpd.GeoDataFrame()
 
-    import geopandas as gpd
     if len(water) > 0 and len(reserves) > 0:
         zones = pd.concat([water[["geometry", "zone", "zone_name"]],
                            reserves[["geometry", "zone", "zone_name"]]], ignore_index=True)
