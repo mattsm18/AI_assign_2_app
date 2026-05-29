@@ -232,8 +232,14 @@ def generate_heatmap_data(df):
     return np.column_stack([lats, lons, intensities])
 
 
+# Load data once
+zones_gdf, zones_index, sea_zones, sea_index = load_spatial_data()
+rbf, scaler, suburbs_df = build_price_model()
+heat_data = generate_heatmap_data(suburbs_df)
+
+# Pre-compute zone features for map rendering
 @st.cache_resource
-def prepare_zone_features(zones_gdf):
+def prepare_zone_features():
     """Pre-compute zone features for map rendering"""
     features = []
     
@@ -253,12 +259,7 @@ def prepare_zone_features(zones_gdf):
     
     return features
 
-
-# Load data once
-zones_gdf, zones_index, sea_zones, sea_index = load_spatial_data()
-rbf, scaler, suburbs_df = build_price_model()
-heat_data = generate_heatmap_data(suburbs_df)
-zone_features = prepare_zone_features(zones_gdf)
+zone_features = prepare_zone_features()
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SPATIAL QUERY FUNCTIONS
