@@ -192,6 +192,11 @@ def load_spatial_data():
 
 # Load data once
 zones_gdf = load_spatial_data()
+
+
+@st.cache_resource
+def build_price_model():
+    """Build interpolation model from suburb data"""
     df = pd.DataFrame(SUBURB_DATA)
     coords = df[["lat", "lon"]].values
     prices = df["price"].values
