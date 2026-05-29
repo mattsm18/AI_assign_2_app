@@ -440,7 +440,7 @@ st.markdown(
 
 col_map, col_panel = st.columns([3, 1])
 
-# ── Map — rendered once, never re-runs on click ───────────────
+# ── Map ───────────────────────────────────────────────────────
 with col_map:
     map_data = st_folium(
         build_base_map(),
@@ -450,74 +450,74 @@ with col_map:
         key="main_map",
     )
 
-# ── Panel — @st.fragment means ONLY this block re-runs on click
-# The map above is completely skipped on subsequent reruns.
-@st.fragment
-def render_panel():
-    clicked = map_data and map_data.get("last_clicked")
+# Persist the last valid click in session_state so panel
+# stays populated across reruns without re-computing anything.
+if map_data and map_data.get("last_clicked"):
+    c = map_data["last_clicked"]
+    st.session_state["_last_click"] = (c["lat"], c["lng"])
 
-    with col_panel:
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
+clicked_coords = st.session_state.get("_last_click")
 
-        if not clicked:
+# ── Panel ─────────────────────────────────────────────────────
+with col_panel:
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-heading'>Estimate</div>", unsafe_allow_html=True)
+
+    if not clicked_coords:
+        st.markdown(
+            "<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        lat, lon = clicked_coords
+        res = predict(lat, lon)
+
+        zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
+        zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
+        z = res["zone"]
+
+        st.markdown(
+            f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
+            unsafe_allow_html=True,
+        )
+
+        if z == "residential" and res["price"] is not None:
             st.markdown(
-                "<p class='hint-text'>← Click the map to estimate land value at any point in Auckland.</p>",
+                f"<div class='price-big'>${res['price']:,.0f}</div>"
+                f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
+                unsafe_allow_html=True,
+            )
+        elif z == "reserve":
+            st.markdown(
+                "<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>"
+                "Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>",
                 unsafe_allow_html=True,
             )
         else:
-            lat = clicked["lat"]
-            lon = clicked["lng"]
-            res = predict(lat, lon)
-
-            zone_labels = {"residential": "Residential", "reserve": "Reserve / Park", "sea": "Ocean"}
-            zone_css    = {"residential": "zone-residential", "reserve": "zone-reserve", "sea": "zone-sea"}
-            z = res["zone"]
-
             st.markdown(
-                f"<span class='zone-badge {zone_css[z]}'>{zone_labels[z]}</span>",
+                "<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>"
+                "Ocean / Water<br><small style='color:#666'>No pricing available</small></div>",
                 unsafe_allow_html=True,
             )
 
-            if z == "residential" and res["price"] is not None:
-                st.markdown(
-                    f"<div class='price-big'>${res['price']:,.0f}</div>"
-                    f"<div class='price-range'>${res['price_low']:,.0f} – ${res['price_high']:,.0f} est. range</div>",
-                    unsafe_allow_html=True,
-                )
-            elif z == "reserve":
-                st.markdown(
-                    "<div style='color:#5eead4;font-size:1rem;margin:0.5rem 0'>"
-                    "Park / Reserve<br><small style='color:#666'>No residential pricing</small></div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    "<div style='color:#60a5fa;font-size:1rem;margin:0.5rem 0'>"
-                    "Ocean / Water<br><small style='color:#666'>No pricing available</small></div>",
-                    unsafe_allow_html=True,
-                )
+        st.markdown(
+            f"<div class='stat-label'>Distance to CBD</div>"
+            f"<div class='stat-value'>{res['cbd_km']:.1f} km</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='stat-label'>Nearest suburb</div>"
+            f"<div class='stat-value'>{res['closest_suburb']}<br>"
+            f"<span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='stat-label'>Coordinates</div>"
+            f"<div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>",
+            unsafe_allow_html=True,
+        )
 
-            st.markdown(
-                f"<div class='stat-label'>Distance to CBD</div>"
-                f"<div class='stat-value'>{res['cbd_km']:.1f} km</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='stat-label'>Nearest suburb</div>"
-                f"<div class='stat-value'>{res['closest_suburb']}<br>"
-                f"<span style='color:#666;font-size:0.75rem'>{res['closest_km']:.1f} km away</span></div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='stat-label'>Coordinates</div>"
-                f"<div class='stat-value' style='font-size:0.78rem'>{lat:.4f}, {lon:.4f}</div>",
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-render_panel()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ── Data explorer ────────────────────────────────────────────
 with st.expander("Suburb reference data"):
