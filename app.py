@@ -265,41 +265,87 @@ zone_features = prepare_zone_features()
 # SPATIAL QUERY FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
-@lru_cache(maxsize=512)
-def classify_zone(lat: float, lon: float) -> tuple[str, str]:
-    """Cached zone classification using spatial index"""
-    lat = round(lat, COORD_PRECISION)
-    lon = round(lon, COORD_PRECISION)
+@st.cache_resource
+def build_zone_lookup():
+    """Build fast grid-based zone lookup to avoid expensive spatial queries"""
+    import numpy as np
     
+    # Create a coarse grid covering Auckland
+    # Grid resolution: ~500m per cell (faster to build)
+    grid_size = 0.005  # ~500m at equator
+    
+    min_lat, max_lat = -37.1, -36.5
+    min_lon, max_lon = 174.5, 175.1
+    
+    grid = {}
+    lat = min_lat
+    while lat <= max_lat:
+        lon = min_lon
+        while lon <= max_lon:
+            key = (round(lat, 3), round(lon, 3))
+            
+            pt = Point(lon, lat)
+            zone = "residential"
+            name = "Residential"
+            
+            # Fast zone check - only check candidates
+            candidates = list(zones_index.query(pt.envelope))
+            for idx in candidates:
+                if zones_gdf.geometry.iloc[idx].contains(pt):
+                    zone = zones_gdf.iloc[idx]["zone"]
+                    name = zones_gdf.iloc[idx].get("name", "Zone")
+                    break
+            
+            grid[key] = (zone, name)
+            lon += grid_size
+        lat += grid_size
+    
+    return grid
+
+zone_grid = build_zone_lookup()
+
+
+def classify_zone_fast(lat: float, lon: float) -> tuple:
+    """Fast grid-based zone lookup"""
+    # Try exact grid cell first
+    lat_key = round(lat, 3)
+    lon_key = round(lon, 3)
+    key = (lat_key, lon_key)
+    
+    if key in zone_grid:
+        return zone_grid[key]
+    
+    # If not in grid, use spatial query
     pt = Point(lon, lat)
-    for idx in zones_index.query(pt.envelope):
+    candidates = list(zones_index.query(pt.envelope))
+    for idx in candidates:
         if zones_gdf.geometry.iloc[idx].contains(pt):
-            row = zones_gdf.iloc[idx]
-            return row["zone"], row.get("name", "Zone")
+            return zones_gdf.iloc[idx]["zone"], zones_gdf.iloc[idx].get("name", "Zone")
     
     return "residential", "Residential"
 
 
+# Memoize classify_zone_fast with LRU cache for clicks within same area
+_classify_zone_cache = {}
+
+def classify_zone_cached(lat: float, lon: float) -> tuple:
+    """Cached wrapper around classify_zone_fast"""
+    key = (round(lat, 4), round(lon, 4))
+    if key not in _classify_zone_cache:
+        _classify_zone_cache[key] = classify_zone_fast(lat, lon)
+    return _classify_zone_cache[key]
+
+
 @lru_cache(maxsize=512)
-def is_ocean(lat: float, lon: float) -> bool:
-    """Cached ocean detection using spatial index"""
-    if sea_index is None:
-        return False
-    
-    lat = round(lat, COORD_PRECISION)
-    lon = round(lon, COORD_PRECISION)
-    
-    pt = Point(lon, lat)
-    for idx in sea_index.query(pt.envelope):
-        if sea_zones.geometry.iloc[idx].contains(pt):
-            return True
-    
-    return False
+def is_ocean_fast(lat: float, lon: float) -> bool:
+    """Fast ocean detection"""
+    zone, _ = classify_zone_cached(lat, lon)
+    return zone == "sea"
 
 
 def predict_price(lat: float, lon: float) -> tuple[float | None, str, str]:
     """Predict land price at given coordinates"""
-    zone, name = classify_zone(lat, lon)
+    zone, name = classify_zone_cached(lat, lon)
     
     if zone != "residential":
         return None, zone, name
@@ -364,7 +410,7 @@ with col_panel:
         lat = map_data["last_clicked"]["lat"]
         lon = map_data["last_clicked"]["lng"]
         
-        if is_ocean(lat, lon):
+        if is_ocean_fast(lat, lon):
             st.warning("Ocean — no pricing model")
         else:
             price, zone, name = predict_price(lat, lon)
