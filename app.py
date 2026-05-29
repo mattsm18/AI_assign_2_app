@@ -175,12 +175,14 @@ def load_zones():
 
     zones_gdf = gpd.GeoDataFrame(zones, geometry="geometry", crs="EPSG:4326")
     
-    # Build spatial index for fast queries
+    # Build spatial indexes for fast queries
     spatial_index = STRtree(zones_gdf.geometry)
+    sea_zones_gdf = zones_gdf[zones_gdf["zone"] == "sea"]
+    sea_spatial_index = STRtree(sea_zones_gdf.geometry) if len(sea_zones_gdf) > 0 else None
     
-    return zones_gdf, spatial_index
+    return zones_gdf, spatial_index, sea_zones_gdf, sea_spatial_index
 
-zones_gdf, zones_spatial_index = load_zones()
+zones_gdf, zones_spatial_index, sea_zones_gdf, sea_spatial_index = load_zones()
 
 # ─────────────────────────────────────────────
 # Model
@@ -232,9 +234,13 @@ heat_data = generate_heat(df)
 # ─────────────────────────────────────────────
 # Spatial logic
 # ─────────────────────────────────────────────
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)
 def classify_zone(lat, lon):
-    """Cached version with hashable arguments"""
+    """Fast cached zone classification"""
+    # Round to 4 decimals (~11m precision) to maximize cache hits
+    lat = round(lat, 4)
+    lon = round(lon, 4)
+    
     pt = Point(lon, lat)
     
     # Use spatial index for fast lookup
@@ -248,24 +254,21 @@ def classify_zone(lat, lon):
     return "residential", "Residential"
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)
 def is_ocean(lat, lon):
-    """Cached version with hashable arguments"""
-    pt = Point(lon, lat)
+    """Fast cached ocean check"""
+    # Round to 4 decimals (~11m precision) to maximize cache hits
+    lat = round(lat, 4)
+    lon = round(lon, 4)
     
-    # Use spatial index to find sea zones only
-    sea_zones = zones_gdf[zones_gdf["zone"] == "sea"]
-    
-    if len(sea_zones) == 0:
+    if sea_spatial_index is None:
         return False
     
-    sea_index = STRtree(sea_zones.geometry)
-    candidates_idx = list(sea_index.query(pt.envelope))
+    pt = Point(lon, lat)
+    candidates_idx = list(sea_spatial_index.query(pt.envelope))
     
     for idx in candidates_idx:
-        # Map back to original sea_zones index
-        original_idx = sea_zones.index[idx]
-        if zones_gdf.geometry.loc[original_idx].contains(pt):
+        if sea_zones_gdf.geometry.iloc[idx].contains(pt):
             return True
     
     return False
