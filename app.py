@@ -224,6 +224,18 @@ SUBURB_DATA = [
 # DATA & MODEL — loaded once, cached as resources
 # ═══════════════════════════════════════════════════════════════
 
+def _iter_polygons(geom):
+    """Yield only Polygon sub-geometries from any Shapely geometry type."""
+    if geom is None or geom.is_empty:
+        return
+    if geom.geom_type == "Polygon":
+        yield geom
+    elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        for part in geom.geoms:
+            yield from _iter_polygons(part)
+    # LineString, Point, etc. are silently skipped
+
+
 @st.cache_resource
 def load_everything():
     """
@@ -248,22 +260,14 @@ def load_everything():
     # ── Park polygon coords for map rendering ────────────────
     park_polys = []
     for geom, name in zip(parks_gdf.geometry, parks_gdf.get("name", ["Park"] * len(parks_gdf))):
-        if geom is None or geom.is_empty:
-            continue
-        polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
-        for poly in polys:
-            coords = [(y, x) for x, y in poly.exterior.coords]
-            park_polys.append((coords, str(name) if name else "Park"))
+        for poly in _iter_polygons(geom):
+            park_polys.append(([(y, x) for x, y in poly.exterior.coords], str(name) if name else "Park"))
 
     # ── Coast polygon coords for map rendering ───────────────
     coast_polys = []
     for geom, name in zip(coast_gdf.geometry, coast_gdf.get("name", ["Coast"] * len(coast_gdf))):
-        if geom is None or geom.is_empty:
-            continue
-        polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
-        for poly in polys:
-            coords = [(y, x) for x, y in poly.exterior.coords]
-            coast_polys.append((coords, str(name) if name else "Coastline"))
+        for poly in _iter_polygons(geom):
+            coast_polys.append(([(y, x) for x, y in poly.exterior.coords], str(name) if name else "Coastline"))
 
     # ── Price model ──────────────────────────────────────────
     df     = pd.DataFrame(SUBURB_DATA)
