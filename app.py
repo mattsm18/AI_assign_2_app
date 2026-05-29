@@ -296,10 +296,9 @@ st.markdown("<p class='subtitle'>Click anywhere on the map</p>", unsafe_allow_ht
 col_map, col_panel = st.columns([3, 1])
 
 # ─────────────────────────────────────────────
-# Build map (cached)
+# Map
 # ─────────────────────────────────────────────
-@st.cache_resource
-def build_map():
+with col_map:
     m = folium.Map(location=[-36.86, 174.76], zoom_start=11, tiles="CartoDB positron")
 
     HeatMap(heat_data, radius=18, blur=14).add_to(m)
@@ -343,17 +342,9 @@ def build_map():
                     fill_opacity=0.15,
                     tooltip=getattr(z, "name", "zone"),
                 ).add_to(m)
-    
-    return m
-
-base_map = build_map()
-
-# ─────────────────────────────────────────────
-# Map
-# ─────────────────────────────────────────────
-with col_map:
+            
     map_data = st_folium(
-        base_map,
+        m,
         width="100%",
         height=600,
         returned_objects=["last_clicked"]
