@@ -193,8 +193,16 @@ def load_landmask():
     if gpd is None:
         return None
 
-    world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
-    nz = world[world["name"] == "New Zealand"]
+    # Natural Earth official dataset (no geopandas internal datasets anymore)
+    url = "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip"
+
+    world = gpd.read_file(url)
+
+    nz = world[world["ADMIN"] == "New Zealand"]
+
+    if nz.empty:
+        return None
+
     return nz.geometry.unary_union
 
 NZ_LAND = load_landmask()
