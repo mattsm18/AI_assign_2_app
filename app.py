@@ -6,63 +6,55 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 from scipy.interpolate import RBFInterpolator
 from sklearn.preprocessing import StandardScaler
-from shapely.geometry import Point, Polygon
+import geopandas as gpd
+from shapely.geometry import Point
 
-# ── optional geopandas for land/ocean detection ────────────────────────────────
-try:
-    import geopandas as gpd
-except ImportError:
-    gpd = None
-
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Auckland Land Price Tool", page_icon="🗺️", layout="wide")
+# ─────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="Auckland Land Price Tool",
+    page_icon="🗺️",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Mono:wght@400;500&display=swap');
+
 html, body, [class*="css"] {
     font-family: 'DM Mono', monospace;
     background-color: #f7f5f0;
     color: #1a1a1a;
 }
+
 h1, h2, h3 {
     font-family: 'DM Serif Display', serif !important;
-    color: #1a1a1a;
 }
+
 .price-card {
     background: #ffffff;
     border: 1.5px solid #2a9d8f;
     border-radius: 8px;
     padding: 1.5rem;
-    color: #1a1a1a;
     margin-top: 1rem;
     box-shadow: 0 2px 8px rgba(0,0,0,0.07);
 }
+
 .price-card h2 {
     color: #2a9d8f;
     font-size: 2rem;
     margin: 0;
     font-family: 'DM Serif Display', serif;
 }
+
 .label {
     font-size: 0.7rem;
     letter-spacing: 0.15em;
     color: #888;
     text-transform: uppercase;
 }
-.zone-badge {
-    display: inline-block;
-    padding: 0.25rem 0.75rem;
-    border-radius: 999px;
-    font-size: 0.72rem;
-    font-weight: 500;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    margin-top: 0.5rem;
-}
-.zone-residential { background: #e8f5f3; color: #1a7a6e; border: 1px solid #2a9d8f; }
-.zone-sea         { background: #e3f4fb; color: #0077a8; border: 1px solid #4cc9f0; }
-.zone-reserve     { background: #eaf5ea; color: #2d6a2d; border: 1px solid #57cc99; }
+
 .subtitle {
     color: #888;
     font-family: 'DM Mono', monospace;
@@ -72,7 +64,9 @@ h1, h2, h3 {
 </style>
 """, unsafe_allow_html=True)
 
-# ── suburb dataset ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Suburb data
+# ─────────────────────────────────────────────
 SUBURB_DATA = [
     # Auckland City / Isthmus
     {"suburb": "Auckland Central",   "lat": -36.8509, "lon": 174.7645, "price": 481000,  "dist_km": 0.5},
@@ -157,55 +151,37 @@ SUBURB_DATA = [
     {"suburb": "Kumeu",              "lat": -36.7817, "lon": 174.5617, "price": 1050000, "dist_km": 30.0},
 ]
 
-# ── zone polygons ──────────────────────────────────────────────────────────────
-ZONE_POLYGONS = [
-    {
-        "name": "Waitakere Ranges",
-        "zone": "reserve",
-        "coords": [
-            (-36.780, 174.450), (-36.780, 174.570), (-36.840, 174.600),
-            (-36.900, 174.590), (-36.960, 174.560), (-37.020, 174.530),
-            (-37.050, 174.490), (-37.020, 174.450), (-36.960, 174.430),
-            (-36.900, 174.420), (-36.840, 174.430), (-36.780, 174.450),
-        ],
-    },
-]
 
-# shapely polygons (lon, lat)
-ZONE_SHAPES = []
-for z in ZONE_POLYGONS:
-    poly = Polygon([(c[1], c[0]) for c in z["coords"]])
-    ZONE_SHAPES.append({"name": z["name"], "zone": z["zone"], "shape": poly})
-
-# ── land mask (NEW) ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Load GeoJSON zones (GIS source of truth)
+# ─────────────────────────────────────────────
 @st.cache_resource
-def load_landmask():
-    if gpd is None:
-        return None
+def load_zones():
+    parks = gpd.read_file("parks.geojson")
+    coast = gpd.read_file("coastline.geojson")
 
-    # Natural Earth official dataset (no geopandas internal datasets anymore)
-    url = "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip"
+    parks = parks.to_crs(epsg=4326)
+    coast = coast.to_crs(epsg=4326)
 
-    world = gpd.read_file(url)
+    parks["zone"] = "reserve"
+    coast["zone"] = "sea"
 
-    nz = world[world["ADMIN"] == "New Zealand"]
+    parks["name"] = parks.get("name", "Park")
+    coast["name"] = coast.get("name", "Coast")
 
-    if nz.empty:
-        return None
+    zones = pd.concat([parks, coast], ignore_index=True)
 
-    return nz.geometry.unary_union
+    return gpd.GeoDataFrame(zones, geometry="geometry", crs="EPSG:4326")
 
-NZ_LAND = load_landmask()
+zones_gdf = load_zones()
 
-def is_ocean(lat, lon):
-    if NZ_LAND is None:
-        return False  # safe fallback (no crash)
-    return not NZ_LAND.contains(Point(lon, lat))
-
-# ── model ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
 @st.cache_resource
 def build_model():
     df = pd.DataFrame(SUBURB_DATA)
+
     coords = df[["lat", "lon"]].values
     prices = df["price"].values
 
@@ -218,81 +194,120 @@ def build_model():
         kernel="thin_plate_spline",
         smoothing=1e9
     )
+
     return rbf, scaler, df
 
+rbf, scaler, df = build_model()
+
+# ─────────────────────────────────────────────
+# Heatmap
+# ─────────────────────────────────────────────
+@st.cache_data
+def generate_heat(df):
+    pmin, pmax = df["price"].min(), df["price"].max()
+    rng = np.random.default_rng(42)
+
+    heat = []
+    for _, r in df.iterrows():
+        intensity = (r["price"] - pmin) / (pmax - pmin)
+
+        for _ in range(25):
+            heat.append([
+                r["lat"] + rng.normal(0, 0.01),
+                r["lon"] + rng.normal(0, 0.01),
+                float(intensity)
+            ])
+
+    return heat
+
+heat_data = generate_heat(df)
+
+# ─────────────────────────────────────────────
+# Spatial logic
+# ─────────────────────────────────────────────
 def classify_zone(lat, lon):
     pt = Point(lon, lat)
-    for z in ZONE_SHAPES:
-        if z["shape"].contains(pt):
-            return z["zone"], z["name"]
+
+    hits = zones_gdf[zones_gdf.contains(pt)]
+
+    if len(hits) > 0:
+        row = hits.iloc[0]
+        return row["zone"], row.get("name", "Zone")
+
     return "residential", "Residential"
 
-def predict_price(lat, lon, rbf, scaler):
-    zone, zone_name = classify_zone(lat, lon)
+
+def is_ocean(lat, lon):
+    pt = Point(lon, lat)
+    land_hits = zones_gdf[zones_gdf["zone"] != "sea"]
+
+    return len(land_hits[land_hits.contains(pt)]) == 0
+
+
+def predict_price(lat, lon):
+    zone, name = classify_zone(lat, lon)
+
     if zone != "residential":
-        return None, zone, zone_name
+        return None, zone, name
 
     coords = scaler.transform([[lat, lon]])
     price = float(rbf(coords)[0])
-    price = max(400000, min(price, 5000000))
-    return price, zone, zone_name
 
-# ── heatmap ────────────────────────────────────────────────────────────────────
-@st.cache_data
-def generate_heatmap_points(suburb_data):
-    df = pd.DataFrame(suburb_data)
-    p_min, p_max = df["price"].min(), df["price"].max()
+    price = np.clip(price, 400000, 5000000)
 
-    rng = np.random.default_rng(42)
-    heat_data = []
+    return price, zone, name
 
-    for _, row in df.iterrows():
-        intensity = 0.2 + 0.8 * (row["price"] - p_min) / (p_max - p_min)
-        jit_lat = rng.normal(0, 0.012, 30)
-        jit_lon = rng.normal(0, 0.012, 30)
-
-        for jl, jn in zip(jit_lat, jit_lon):
-            heat_data.append([row["lat"] + jl, row["lon"] + jn, float(intensity)])
-
-    return heat_data
-
-# ── build ──────────────────────────────────────────────────────────────────────
-rbf, scaler, df = build_model()
-heat_data = generate_heatmap_points(SUBURB_DATA)
-
-# ── UI ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
 st.title("Auckland Land Price Estimator")
-st.markdown("<p class='subtitle'>Click anywhere on the map to estimate land value</p>", unsafe_allow_html=True)
+st.markdown("<p class='subtitle'>Click anywhere on the map</p>", unsafe_allow_html=True)
 
 col_map, col_panel = st.columns([3, 1])
 
+# ─────────────────────────────────────────────
+# Map
+# ─────────────────────────────────────────────
 with col_map:
     m = folium.Map(location=[-36.86, 174.76], zoom_start=11, tiles="CartoDB positron")
 
     HeatMap(heat_data, radius=18, blur=14).add_to(m)
 
-    for _, row in df.iterrows():
+    for _, r in df.iterrows():
         folium.CircleMarker(
-            location=[row["lat"], row["lon"]],
+            location=[r["lat"], r["lon"]],
             radius=5,
-            color="#1a1a1a",
             fill=True,
             fill_color="#fff",
-            fill_opacity=0.9,
-            tooltip=row["suburb"],
+            color="#000",
+            tooltip=f"{r['suburb']} - ${r['price']:,.0f}"
         ).add_to(m)
 
-    for z in ZONE_POLYGONS:
-        folium.Polygon(
-            locations=z["coords"],
-            color="#4cc9f0" if z["zone"] == "sea" else "#57cc99",
-            fill=True,
-            fill_opacity=0.15,
-            tooltip=z["name"],
-        ).add_to(m)
+    # draw GIS zones
+    for _, z in zones_gdf.iterrows():
+        geom = z.geometry
 
-    map_data = st_folium(m, width="100%", height=560, returned_objects=["last_clicked"])
+        if geom.geom_type == "Polygon":
+            coords = [(y, x) for x, y in geom.exterior.coords]
 
+            folium.Polygon(
+                locations=coords,
+                color="#4cc9f0" if z["zone"] == "sea" else "#57cc99",
+                fill=True,
+                fill_opacity=0.15,
+                tooltip=z.get("name", z["zone"])
+            ).add_to(m)
+
+    map_data = st_folium(
+        m,
+        width="100%",
+        height=600,
+        returned_objects=["last_clicked"]
+    )
+
+# ─────────────────────────────────────────────
+# Panel
+# ─────────────────────────────────────────────
 with col_panel:
     st.markdown("### Estimate")
 
@@ -300,19 +315,25 @@ with col_panel:
         lat = map_data["last_clicked"]["lat"]
         lon = map_data["last_clicked"]["lng"]
 
-        # NEW: ocean detection
         if is_ocean(lat, lon):
-            price, zone, zone_name = None, "sea", "Ocean"
+            st.warning("Ocean — no pricing model")
         else:
-            price, zone, zone_name = predict_price(lat, lon, rbf, scaler)
+            price, zone, name = predict_price(lat, lon)
 
-        if price is not None:
-            st.metric("Estimated Price", f"${price:,.0f}")
-        else:
-            st.warning(f"{zone_name} — no residential estimate")
+            if price is not None:
+                st.metric("Estimated Price", f"${price:,.0f}")
+            else:
+                st.info(f"{name} zone — no residential estimate")
 
-        dist_km = np.linalg.norm(np.array([lat, lon]) - np.array([-36.8485, 174.7633])) * 111
-        st.metric("Distance from CBD", f"{dist_km:.1f} km")
+        cbd = np.array([-36.8485, 174.7633])
+        dist = np.linalg.norm(np.array([lat, lon]) - cbd) * 111
+        st.metric("Distance from CBD", f"{dist:.1f} km")
 
     else:
-        st.info("Click the map to get an estimate")
+        st.info("Click map to estimate land value")
+
+# ─────────────────────────────────────────────
+# Data view
+# ─────────────────────────────────────────────
+with st.expander("Suburb data"):
+    st.dataframe(df)
