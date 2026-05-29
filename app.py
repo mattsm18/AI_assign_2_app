@@ -8,6 +8,8 @@ from scipy.interpolate import RBFInterpolator
 from sklearn.preprocessing import StandardScaler
 import geopandas as gpd
 from shapely.geometry import Point
+from shapely.strtree import STRtree
+from functools import lru_cache
 
 # ─────────────────────────────────────────────
 # Page config
@@ -171,9 +173,14 @@ def load_zones():
 
     zones = pd.concat([parks, coast], ignore_index=True)
 
-    return gpd.GeoDataFrame(zones, geometry="geometry", crs="EPSG:4326")
+    zones_gdf = gpd.GeoDataFrame(zones, geometry="geometry", crs="EPSG:4326")
+    
+    # Build spatial index for fast queries
+    spatial_index = STRtree(zones_gdf.geometry)
+    
+    return zones_gdf, spatial_index
 
-zones_gdf = load_zones()
+zones_gdf, zones_spatial_index = load_zones()
 
 # ─────────────────────────────────────────────
 # Model
@@ -225,23 +232,43 @@ heat_data = generate_heat(df)
 # ─────────────────────────────────────────────
 # Spatial logic
 # ─────────────────────────────────────────────
+@lru_cache(maxsize=256)
 def classify_zone(lat, lon):
+    """Cached version with hashable arguments"""
     pt = Point(lon, lat)
-
-    hits = zones_gdf[zones_gdf.contains(pt)]
-
-    if len(hits) > 0:
-        row = hits.iloc[0]
-        return row["zone"], row.get("name", "Zone")
-
+    
+    # Use spatial index for fast lookup
+    candidates_idx = list(zones_spatial_index.query(pt.envelope))
+    
+    for idx in candidates_idx:
+        if zones_gdf.geometry.iloc[idx].contains(pt):
+            row = zones_gdf.iloc[idx]
+            return row["zone"], row.get("name", "Zone")
+    
     return "residential", "Residential"
 
 
+@lru_cache(maxsize=256)
 def is_ocean(lat, lon):
+    """Cached version with hashable arguments"""
     pt = Point(lon, lat)
-    land_hits = zones_gdf[zones_gdf["zone"] != "sea"]
-
-    return len(land_hits[land_hits.contains(pt)]) == 0
+    
+    # Use spatial index to find sea zones only
+    sea_zones = zones_gdf[zones_gdf["zone"] == "sea"]
+    
+    if len(sea_zones) == 0:
+        return False
+    
+    sea_index = STRtree(sea_zones.geometry)
+    candidates_idx = list(sea_index.query(pt.envelope))
+    
+    for idx in candidates_idx:
+        # Map back to original sea_zones index
+        original_idx = sea_zones.index[idx]
+        if zones_gdf.geometry.loc[original_idx].contains(pt):
+            return True
+    
+    return False
 
 
 def predict_price(lat, lon):
@@ -283,8 +310,7 @@ with col_map:
             tooltip=f"{r['suburb']} - ${r['price']:,.0f}"
         ).add_to(m)
 
-    # draw GIS zones
-    for z in zones_gdf.itertuples():
+    for z_idx, z in enumerate(zones_gdf.itertuples()):
         geom = z.geometry
 
         if geom is None or geom.is_empty:
