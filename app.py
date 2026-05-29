@@ -19,7 +19,6 @@ from scipy.interpolate import RBFInterpolator
 from sklearn.preprocessing import StandardScaler
 import geopandas as gpd
 from shapely.geometry import Point
-from shapely.strtree import STRtree
 from functools import lru_cache
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -173,7 +172,7 @@ SUBURB_DATA = [
 
 @st.cache_resource
 def load_spatial_data():
-    """Load and index GeoJSON zones"""
+    """Load GeoJSON zones"""
     parks = gpd.read_file("parks.geojson").to_crs(epsg=4326)
     coast = gpd.read_file("coastline.geojson").to_crs(epsg=4326)
     
@@ -188,17 +187,11 @@ def load_spatial_data():
         crs="EPSG:4326"
     )
     
-    # Build spatial indexes
-    zones_index = STRtree(zones_gdf.geometry)
-    sea_zones = zones_gdf[zones_gdf["zone"] == "sea"]
-    sea_index = STRtree(sea_zones.geometry) if len(sea_zones) > 0 else None
-    
-    return zones_gdf, zones_index, sea_zones, sea_index
+    return zones_gdf
 
 
-@st.cache_resource
-def build_price_model():
-    """Build interpolation model from suburb data"""
+# Load data once
+zones_gdf = load_spatial_data()
     df = pd.DataFrame(SUBURB_DATA)
     coords = df[["lat", "lon"]].values
     prices = df["price"].values
@@ -267,73 +260,67 @@ zone_features = prepare_zone_features()
 
 @st.cache_resource
 def build_zone_lookup():
-    """Build fast grid-based zone lookup to avoid expensive spatial queries"""
-    import numpy as np
+    """Build fast zone lookup using bounding boxes"""
+    # Pre-compute zone bounding boxes for quick filtering
+    zones_info = []
     
-    # Create a coarse grid covering Auckland
-    # Grid resolution: ~500m per cell (faster to build)
-    grid_size = 0.005  # ~500m at equator
+    for idx, row in zones_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        
+        bounds = geom.bounds  # (minx, miny, maxx, maxy)
+        zones_info.append({
+            'idx': idx,
+            'zone': row['zone'],
+            'name': row.get('name', 'Zone'),
+            'bounds': bounds,
+            'geom': geom
+        })
     
-    min_lat, max_lat = -37.1, -36.5
-    min_lon, max_lon = 174.5, 175.1
-    
-    grid = {}
-    lat = min_lat
-    while lat <= max_lat:
-        lon = min_lon
-        while lon <= max_lon:
-            key = (round(lat, 3), round(lon, 3))
-            
-            pt = Point(lon, lat)
-            zone = "residential"
-            name = "Residential"
-            
-            # Fast zone check - only check candidates
-            candidates = list(zones_index.query(pt.envelope))
-            for idx in candidates:
-                if zones_gdf.geometry.iloc[idx].contains(pt):
-                    zone = zones_gdf.iloc[idx]["zone"]
-                    name = zones_gdf.iloc[idx].get("name", "Zone")
-                    break
-            
-            grid[key] = (zone, name)
-            lon += grid_size
-        lat += grid_size
-    
-    return grid
+    return zones_info
 
-zone_grid = build_zone_lookup()
+zones_info = build_zone_lookup()
 
 
 def classify_zone_fast(lat: float, lon: float) -> tuple:
-    """Fast grid-based zone lookup"""
-    # Try exact grid cell first
-    lat_key = round(lat, 3)
-    lon_key = round(lon, 3)
-    key = (lat_key, lon_key)
+    """Fast zone lookup using bounding box pre-filtering"""
+    # First check bounding boxes (very fast)
+    candidates = []
+    for zone_info in zones_info:
+        minx, miny, maxx, maxy = zone_info['bounds']
+        if minx <= lon <= maxx and miny <= lat <= maxy:
+            candidates.append(zone_info)
     
-    if key in zone_grid:
-        return zone_grid[key]
+    # If no candidates, it's residential
+    if not candidates:
+        return "residential", "Residential"
     
-    # If not in grid, use spatial query
+    # Check geometric containment only for candidates
     pt = Point(lon, lat)
-    candidates = list(zones_index.query(pt.envelope))
-    for idx in candidates:
-        if zones_gdf.geometry.iloc[idx].contains(pt):
-            return zones_gdf.iloc[idx]["zone"], zones_gdf.iloc[idx].get("name", "Zone")
+    for zone_info in candidates:
+        if zone_info['geom'].contains(pt):
+            return zone_info['zone'], zone_info['name']
     
     return "residential", "Residential"
 
 
-# Memoize classify_zone_fast with LRU cache for clicks within same area
-_classify_zone_cache = {}
+# Use Streamlit session state for persistent caching across reruns
+if 'zone_cache' not in st.session_state:
+    st.session_state.zone_cache = {}
+
+if 'ocean_cache' not in st.session_state:
+    st.session_state.ocean_cache = {}
+
 
 def classify_zone_cached(lat: float, lon: float) -> tuple:
-    """Cached wrapper around classify_zone_fast"""
+    """Cached zone lookup using session state"""
     key = (round(lat, 4), round(lon, 4))
-    if key not in _classify_zone_cache:
-        _classify_zone_cache[key] = classify_zone_fast(lat, lon)
-    return _classify_zone_cache[key]
+    
+    if key not in st.session_state.zone_cache:
+        st.session_state.zone_cache[key] = classify_zone_fast(lat, lon)
+    
+    return st.session_state.zone_cache[key]
 
 
 @lru_cache(maxsize=512)
