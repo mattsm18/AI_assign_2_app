@@ -231,7 +231,7 @@ def generate_heatmap_data(df):
 
 
 # Load data once
-zones_gdf, zones_index, sea_zones, sea_index = load_spatial_data()
+zones_gdf = load_spatial_data()
 rbf, scaler, suburbs_df = build_price_model()
 heat_data = generate_heatmap_data(suburbs_df)
 
