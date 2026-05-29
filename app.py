@@ -382,4 +382,4 @@ with col_panel:
 # DATA EXPLORER
 # ─────────────────────────────────────────────
 with st.expander("Suburb data"):
-    st.dataframe(suburbs_df, use_container_width=True)
+    st.dataframe(suburbs_df, width='stretch')
