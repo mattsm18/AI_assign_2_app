@@ -296,9 +296,10 @@ st.markdown("<p class='subtitle'>Click anywhere on the map</p>", unsafe_allow_ht
 col_map, col_panel = st.columns([3, 1])
 
 # ─────────────────────────────────────────────
-# Map
+# Build map (cached)
 # ─────────────────────────────────────────────
-with col_map:
+@st.cache_resource
+def build_map():
     m = folium.Map(location=[-36.86, 174.76], zoom_start=11, tiles="CartoDB positron")
 
     HeatMap(heat_data, radius=18, blur=14).add_to(m)
@@ -313,15 +314,16 @@ with col_map:
             tooltip=f"{r['suburb']} - ${r['price']:,.0f}"
         ).add_to(m)
 
-    for z_idx, z in enumerate(zones_gdf.itertuples()):
+    # Draw GIS zones (Polygon and MultiPolygon support)
+    for z in zones_gdf.itertuples():
         geom = z.geometry
 
         if geom is None or geom.is_empty:
             continue
 
+        # Handle Polygon
         if geom.geom_type == "Polygon":
             coords = [(y, x) for x, y in geom.exterior.coords]
-
             folium.Polygon(
                 locations=coords,
                 color="#4cc9f0",
@@ -329,9 +331,29 @@ with col_map:
                 fill_opacity=0.15,
                 tooltip=getattr(z, "name", "zone"),
             ).add_to(m)
-            
+        
+        # Handle MultiPolygon
+        elif geom.geom_type == "MultiPolygon":
+            for poly in geom.geoms:
+                coords = [(y, x) for x, y in poly.exterior.coords]
+                folium.Polygon(
+                    locations=coords,
+                    color="#4cc9f0",
+                    fill=True,
+                    fill_opacity=0.15,
+                    tooltip=getattr(z, "name", "zone"),
+                ).add_to(m)
+    
+    return m
+
+base_map = build_map()
+
+# ─────────────────────────────────────────────
+# Map
+# ─────────────────────────────────────────────
+with col_map:
     map_data = st_folium(
-        m,
+        base_map,
         width="100%",
         height=600,
         returned_objects=["last_clicked"]
